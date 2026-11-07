@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Calendar,
   Phone,
@@ -14,6 +14,8 @@ import {
   AlertCircle,
   FileText,
   Package,
+  DollarSign,
+  Send,
 } from 'lucide-react';
 import StatusBadge from '../common/StatusBadge';
 import PaymentBadge from '../common/PaymentBadge';
@@ -22,11 +24,13 @@ import {
   calculateBalance,
   getPaymentStatus,
 } from '../../utils/paymentUtils';
+import { getTodayFormatted } from '../../utils/dateUtils';
 import { useApp } from '../../context/AppContext';
 
 export default function CustomerDetails({ customer, onBack }) {
-  const { navigateTo, showToast } = useApp();
+  const { navigateTo, updateCustomer, showToast, isLoading } = useApp();
   const printRef = useRef(null);
+  const [isUpdating, setIsUpdating] = useState(false);
 
   if (!customer) {
     return (
@@ -52,6 +56,45 @@ export default function CustomerDetails({ customer, onBack }) {
 
   const handlePrint = () => {
     window.print();
+  };
+
+  // Quick Settle Balance
+  const handleQuickSettleBalance = async () => {
+    if (!customer.rowNumber) return;
+    setIsUpdating(true);
+    try {
+      const fullAmount = customer.estimate || customer.paid || '0';
+      await updateCustomer(customer.rowNumber, {
+        ...customer,
+        paid: String(fullAmount),
+      });
+      showToast(`Job ${customer.jobId} marked as fully paid!`, 'success');
+    } catch (err) {
+      // Handled in context
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  // Quick Status Update
+  const handleQuickStatusChange = async (newStatus) => {
+    if (!customer.rowNumber) return;
+    setIsUpdating(true);
+    try {
+      const updates = {
+        ...customer,
+        status: newStatus,
+      };
+      if (newStatus === 'Completed' && !customer.returnedDate) {
+        updates.returnedDate = getTodayFormatted();
+      }
+      await updateCustomer(customer.rowNumber, updates);
+      showToast(`Status updated to ${newStatus}`, 'success');
+    } catch (err) {
+      // Handled in context
+    } finally {
+      setIsUpdating(false);
+    }
   };
 
   const cleanPhone = String(customer.contact || '').replace(/[^0-9]/g, '');
@@ -126,6 +169,41 @@ export default function CustomerDetails({ customer, onBack }) {
 
         {/* Content Grid */}
         <div className="p-6 sm:p-8 space-y-8">
+          {/* Quick Counter Action Bar */}
+          <div className="p-4 rounded-xl bg-blue-50/60 border border-blue-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2">
+              <Clock className="w-4 h-4 text-blue-600 flex-shrink-0" />
+              <span className="font-semibold text-slate-800">Quick Repair Status:</span>
+              <div className="flex flex-wrap gap-1">
+                {['Pending', 'In Progress', 'Completed', 'G/S'].map((st) => (
+                  <button
+                    key={st}
+                    onClick={() => handleQuickStatusChange(st)}
+                    disabled={isUpdating || customer.status === st}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-all ${
+                      customer.status === st
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'bg-white text-slate-600 hover:bg-slate-100 border border-slate-200'
+                    }`}
+                  >
+                    {st}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {balance > 0 && (
+              <button
+                onClick={handleQuickSettleBalance}
+                disabled={isUpdating}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold shadow-xs transition-colors self-start sm:self-auto"
+              >
+                <DollarSign className="w-3.5 h-3.5" />
+                <span>Collect Balance ({formatCurrency(balance)})</span>
+              </button>
+            )}
+          </div>
+
           {/* Customer & Device Quick Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Customer Information */}
