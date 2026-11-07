@@ -15,12 +15,12 @@ const AppContext = createContext(null);
 export function AppProvider({ children }) {
   const auth = useGoogleAuth();
   const [config, setConfig] = useState(() => getSavedConfig());
-  const [customers, setCustomers] = useState(() => [...INITIAL_REFERENCE_DATA]);
+  const [customers, setCustomers] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [error, setError] = useState(null);
   const [lastSyncTime, setLastSyncTime] = useState(null);
-  const [isLiveGoogleSheet, setIsLiveGoogleSheet] = useState(false);
+  const [isLiveGoogleSheet, setIsLiveGoogleSheet] = useState(true);
 
   // Navigation state
   const [activePage, setActivePage] = useState('dashboard'); // 'dashboard' | 'all-jobs' | 'add-customer' | 'pending' | 'completed' | 'payments' | 'settings' | 'details'
@@ -47,12 +47,12 @@ export function AppProvider({ children }) {
     showToast('Configuration settings updated successfully', 'success');
   }, [auth, showToast]);
 
-  // Load data from Google Sheets when signed in
+  // Load data from Google Sheets (reads live by default)
   const loadDataFromSheet = useCallback(async (token, currentConfig) => {
     const activeToken = token || auth.accessToken;
     const cfg = currentConfig || config;
 
-    if (!activeToken || !cfg.spreadsheetId) {
+    if (!cfg.spreadsheetId) {
       setIsLiveGoogleSheet(false);
       return;
     }
@@ -61,58 +61,52 @@ export function AppProvider({ children }) {
     setError(null);
     try {
       const result = await fetchSheetData(cfg.spreadsheetId, cfg.sheetName, activeToken);
-      if (result.isEmpty) {
-        setCustomers([]);
-        showToast('Google Sheet is currently empty. Headers can be initialized in Settings.', 'info');
-      } else {
+      if (result.records && result.records.length > 0) {
         setCustomers(result.records);
+        setIsLiveGoogleSheet(true);
+      } else if (result.isEmpty) {
+        setCustomers([]);
+        setIsLiveGoogleSheet(true);
       }
-      setIsLiveGoogleSheet(true);
       setLastSyncTime(new Date());
     } catch (err) {
       console.error('Failed to load data from Google Sheets:', err);
       const errMsg = err.message || 'Error fetching data from Google Sheet';
       setError(errMsg);
-      showToast(errMsg, 'error');
     } finally {
       setIsSyncing(false);
       setIsLoading(false);
     }
-  }, [auth.accessToken, config, showToast]);
+  }, [auth.accessToken, config]);
 
-  // Trigger sync on token change
+  // Initial and reactive sync on load / token change
   useEffect(() => {
-    if (auth.isSignedIn && auth.accessToken && config.spreadsheetId) {
-      loadDataFromSheet(auth.accessToken, config);
-    } else {
-      setIsLiveGoogleSheet(false);
-    }
-  }, [auth.isSignedIn, auth.accessToken, config.spreadsheetId, loadDataFromSheet]);
+    loadDataFromSheet(auth.accessToken, config);
+  }, [auth.accessToken, config.spreadsheetId, config.sheetName, loadDataFromSheet]);
 
   // Add customer
   const addCustomer = useCallback(async (record) => {
     setIsLoading(true);
     try {
-      if (isLiveGoogleSheet && auth.accessToken && config.spreadsheetId) {
-        // Direct write to Google Sheet
+      let activeToken = auth.accessToken;
+      if (!activeToken) {
+        showToast('Please sign in with Google to write to the spreadsheet', 'info');
+        try {
+          activeToken = await auth.signIn(false);
+        } catch (authErr) {
+          throw new Error('Google authorization is required to save records directly to the Google Sheet.');
+        }
+      }
+
+      if (activeToken && config.spreadsheetId) {
         await appendCustomerToSheet(
           config.spreadsheetId,
           config.sheetName,
           record,
-          auth.accessToken
+          activeToken
         );
-        // Refresh to guarantee authoritative data and row numbers
-        await loadDataFromSheet(auth.accessToken, config);
+        await loadDataFromSheet(activeToken, config);
         showToast(`Job ${record.jobId} saved to Google Sheets successfully!`, 'success');
-      } else {
-        // Fallback demo/preview mode
-        const demoRow = 500 + customers.length + 1;
-        const newRecord = { ...record, rowNumber: demoRow };
-        setCustomers((prev) => [newRecord, ...prev]);
-        showToast(
-          `Job ${record.jobId} created in Preview Mode. Connect Google Sheets in Settings to persist live.`,
-          'info'
-        );
       }
       return true;
     } catch (err) {
@@ -122,29 +116,32 @@ export function AppProvider({ children }) {
     } finally {
       setIsLoading(false);
     }
-  }, [isLiveGoogleSheet, auth.accessToken, config, customers.length, loadDataFromSheet, showToast]);
+  }, [auth, config, loadDataFromSheet, showToast]);
 
   // Update customer
   const updateCustomer = useCallback(async (rowNumber, updatedRecord) => {
     setIsLoading(true);
     try {
-      if (isLiveGoogleSheet && auth.accessToken && config.spreadsheetId) {
-        // Direct update to specific row in Google Sheet
+      let activeToken = auth.accessToken;
+      if (!activeToken) {
+        showToast('Please sign in with Google to update the spreadsheet', 'info');
+        try {
+          activeToken = await auth.signIn(false);
+        } catch (authErr) {
+          throw new Error('Google authorization is required to update records directly in the Google Sheet.');
+        }
+      }
+
+      if (activeToken && config.spreadsheetId) {
         await updateCustomerInSheet(
           config.spreadsheetId,
           config.sheetName,
           rowNumber,
           updatedRecord,
-          auth.accessToken
+          activeToken
         );
-        await loadDataFromSheet(auth.accessToken, config);
+        await loadDataFromSheet(activeToken, config);
         showToast(`Job ${updatedRecord.jobId} updated in Google Sheets!`, 'success');
-      } else {
-        // Fallback demo update
-        setCustomers((prev) =>
-          prev.map((item) => (item.jobId === updatedRecord.jobId ? { ...updatedRecord, rowNumber } : item))
-        );
-        showToast(`Job ${updatedRecord.jobId} updated in Preview Mode.`, 'info');
       }
       return true;
     } catch (err) {
@@ -154,24 +151,31 @@ export function AppProvider({ children }) {
     } finally {
       setIsLoading(false);
     }
-  }, [isLiveGoogleSheet, auth.accessToken, config, loadDataFromSheet, showToast]);
+  }, [auth, config, loadDataFromSheet, showToast]);
 
   // Delete customer / clear row
   const deleteCustomer = useCallback(async (customer) => {
     setIsLoading(true);
     try {
-      if (isLiveGoogleSheet && auth.accessToken && config.spreadsheetId && customer.rowNumber) {
+      let activeToken = auth.accessToken;
+      if (!activeToken) {
+        showToast('Please sign in with Google to clear records from the spreadsheet', 'info');
+        try {
+          activeToken = await auth.signIn(false);
+        } catch (authErr) {
+          throw new Error('Google authorization is required to delete records in the Google Sheet.');
+        }
+      }
+
+      if (activeToken && config.spreadsheetId && customer.rowNumber) {
         await clearCustomerRowInSheet(
           config.spreadsheetId,
           config.sheetName,
           customer.rowNumber,
-          auth.accessToken
+          activeToken
         );
-        await loadDataFromSheet(auth.accessToken, config);
+        await loadDataFromSheet(activeToken, config);
         showToast(`Job ${customer.jobId} cleared from Google Sheets`, 'success');
-      } else {
-        setCustomers((prev) => prev.filter((item) => item.jobId !== customer.jobId));
-        showToast(`Job ${customer.jobId} removed in Preview Mode`, 'info');
       }
       return true;
     } catch (err) {
@@ -181,7 +185,7 @@ export function AppProvider({ children }) {
     } finally {
       setIsLoading(false);
     }
-  }, [isLiveGoogleSheet, auth.accessToken, config, loadDataFromSheet, showToast]);
+  }, [auth, config, loadDataFromSheet, showToast]);
 
   // Initialize Sheet Headers
   const initializeHeaders = useCallback(async () => {

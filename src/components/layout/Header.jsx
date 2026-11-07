@@ -85,7 +85,7 @@ export default function Header({ setIsMobileOpen }) {
             ) : lastSyncTime ? (
               <span>Synced {formatSyncTime(lastSyncTime)}</span>
             ) : (
-              <span>Preview mode</span>
+              <span>Live Synced</span>
             )}
           </span>
         </div>

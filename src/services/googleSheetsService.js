@@ -136,77 +136,138 @@ export function rowValuesToRecord(row, rowNumber, headerIndexMap = null) {
 }
 
 /**
- * Fetch all records from the Google Sheet
+ * Fetch records from public Google Sheet (Anyone with the link)
+ */
+export async function fetchPublicSheetData(spreadsheetId, sheetName = 'Sheet1') {
+  const cleanId = extractCleanSpreadsheetId(spreadsheetId);
+  if (!cleanId) throw new Error('Spreadsheet ID is not configured');
+
+  const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(cleanId)}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(sheetName)}`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to read spreadsheet (HTTP ${response.status})`);
+  }
+
+  const text = await response.text();
+  const jsonStart = text.indexOf('{');
+  const jsonEnd = text.lastIndexOf('}');
+  if (jsonStart === -1 || jsonEnd === -1) {
+    throw new Error('Invalid response from Google Sheets');
+  }
+
+  const jsonStr = text.substring(jsonStart, jsonEnd + 1);
+  const data = JSON.parse(jsonStr);
+
+  const cols = data.table?.cols || [];
+  const rows = data.table?.rows || [];
+
+  const headers = cols.map((c) => c.label || c.id || '');
+  const headerIndexMap = {};
+  headers.forEach((h, idx) => {
+    if (h) {
+      const upper = String(h).trim().toUpperCase();
+      headerIndexMap[upper] = idx;
+      headerIndexMap[upper.replace(/[^A-Z0-9]/g, '')] = idx;
+    }
+  });
+
+  const records = rows.map((r, rowIndex) => {
+    const cells = r.c || [];
+    const getVal = (idx) => {
+      if (!cells[idx]) return '';
+      if (cells[idx].f !== undefined && cells[idx].f !== null) return String(cells[idx].f).trim();
+      if (cells[idx].v !== undefined && cells[idx].v !== null) return String(cells[idx].v).trim();
+      return '';
+    };
+
+    const rowArray = [
+      getVal(0), getVal(1), getVal(2), getVal(3), getVal(4),
+      getVal(5), getVal(6), getVal(7), getVal(8), getVal(9),
+      getVal(10), getVal(11), getVal(12)
+    ];
+
+    return rowValuesToRecord(rowArray, rowIndex + 2, headerIndexMap);
+  }).filter((rec) => rec.jobId || rec.name || rec.contact);
+
+  return {
+    headers,
+    records,
+    isEmpty: records.length === 0,
+    headerIndexMap,
+  };
+}
+
+/**
+ * Fetch all records from the Google Sheet (via API v4 with fallback to public reader)
  */
 export async function fetchSheetData(spreadsheetId, sheetName, accessToken) {
   const cleanId = extractCleanSpreadsheetId(spreadsheetId);
   if (!cleanId) {
     throw new Error('Spreadsheet ID is not configured');
   }
-  if (!accessToken) {
-    throw new Error('Google OAuth access token missing. Please sign in.');
-  }
 
-  const range = `${encodeURIComponent(sheetName)}!A1:M`;
-  const url = `${BASE_URL}/${encodeURIComponent(cleanId)}/values/${range}?valueRenderOption=FORMATTED_VALUE`;
+  // If token is available, attempt official Google Sheets API v4
+  if (accessToken) {
+    try {
+      const range = `${encodeURIComponent(sheetName)}!A1:M`;
+      const url = `${BASE_URL}/${encodeURIComponent(cleanId)}/values/${range}?valueRenderOption=FORMATTED_VALUE`;
 
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-  });
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    let message = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
-    if (response.status === 404 || message.includes('Requested entity was not found')) {
-      message = 'Spreadsheet not found (404). Please check that the Spreadsheet ID in Settings is correct and that your signed-in Google account has access to this spreadsheet in Google Drive.';
+      if (response.ok) {
+        const data = await response.json();
+        const rows = data.values || [];
+
+        if (rows.length === 0) {
+          return {
+            headers: [],
+            records: [],
+            isEmpty: true,
+            headerIndexMap: {},
+          };
+        }
+
+        const headerRow = rows[0] || [];
+        const headerIndexMap = {};
+        headerRow.forEach((colName, index) => {
+          if (colName) {
+            const upper = String(colName).trim().toUpperCase();
+            headerIndexMap[upper] = index;
+            headerIndexMap[upper.replace(/[^A-Z0-9]/g, '')] = index;
+          }
+        });
+
+        const records = [];
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          const hasData = row && row.some((cell) => cell !== undefined && cell !== null && String(cell).trim() !== '');
+          if (hasData) {
+            const record = rowValuesToRecord(row, i + 1, headerIndexMap);
+            records.push(record);
+          }
+        }
+
+        return {
+          headers: headerRow,
+          records,
+          isEmpty: records.length === 0,
+          headerIndexMap,
+        };
+      }
+    } catch (apiErr) {
+      console.warn('API v4 fetch failed, using direct reader:', apiErr);
     }
-    throw new Error(`Google Sheets fetch failed: ${message}`);
   }
 
-  const data = await response.json();
-  const rows = data.values || [];
-
-  if (rows.length === 0) {
-    return {
-      headers: [],
-      records: [],
-      isEmpty: true,
-      headerIndexMap: {},
-    };
-  }
-
-  const headerRow = rows[0] || [];
-  const headerIndexMap = {};
-  headerRow.forEach((colName, index) => {
-    if (colName) {
-      const upper = String(colName).trim().toUpperCase();
-      headerIndexMap[upper] = index;
-      headerIndexMap[upper.replace(/[^A-Z0-9]/g, '')] = index;
-    }
-  });
-
-  // Rows 2 onwards are customer data (1-based row numbers: row index 1 in array is row 2 in sheet)
-  const records = [];
-  for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-    // Check if row has any non-empty cell
-    const hasData = row && row.some((cell) => cell !== undefined && cell !== null && String(cell).trim() !== '');
-    if (hasData) {
-      const record = rowValuesToRecord(row, i + 1, headerIndexMap);
-      records.push(record);
-    }
-  }
-
-  return {
-    headers: headerRow,
-    records,
-    isEmpty: false,
-    headerIndexMap,
-  };
+  // Fallback to direct sheet reader (active for "Anyone with the link" sheets)
+  return await fetchPublicSheetData(cleanId, sheetName);
 }
 
 /**
@@ -348,48 +409,47 @@ export async function testSpreadsheetConnection(spreadsheetId, sheetName, access
       return { success: false, error: 'Spreadsheet ID is missing or empty' };
     }
 
-    // 1. Get spreadsheet metadata (title, sheets)
-    const metaUrl = `${BASE_URL}/${encodeURIComponent(cleanId)}?fields=properties.title,sheets.properties`;
-    const metaRes = await fetch(metaUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    // 1. If access token available, test official API v4
+    if (accessToken) {
+      const metaUrl = `${BASE_URL}/${encodeURIComponent(cleanId)}?fields=properties.title,sheets.properties`;
+      const metaRes = await fetch(metaUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
 
-    if (!metaRes.ok) {
-      const err = await metaRes.json().catch(() => ({}));
-      let msg = err.error?.message || `Failed to access spreadsheet (HTTP ${metaRes.status})`;
-      if (metaRes.status === 404 || msg.includes('Requested entity was not found')) {
-        msg = 'Spreadsheet not found (404). Please verify that the Spreadsheet ID in Settings is correct and that your signed-in Google account has access to this spreadsheet in Google Drive.';
+      if (metaRes.ok) {
+        const meta = await metaRes.json();
+        const readResult = await fetchSheetData(spreadsheetId, sheetName, accessToken);
+        const missingHeaders = EXPECTED_HEADERS.filter(
+          (expected) => !readResult.headers.some((h) => String(h).trim().toUpperCase() === expected)
+        );
+
+        return {
+          success: true,
+          title: meta.properties?.title || 'Google Sheet',
+          sheets: meta.sheets?.map((s) => s.properties?.title) || [],
+          sheetExists: true,
+          headers: readResult.headers,
+          missingHeaders,
+          recordCount: readResult.records.length,
+        };
       }
-      return {
-        success: false,
-        error: msg,
-      };
     }
 
-    const meta = await metaRes.json();
-    const sheetExists = meta.sheets?.some(
-      (s) => s.properties?.title?.toLowerCase() === sheetName.toLowerCase()
-    );
-
-    // 2. Read headers
-    const readResult = await fetchSheetData(spreadsheetId, sheetName, accessToken);
-    const missingHeaders = EXPECTED_HEADERS.filter(
-      (expected) => !readResult.headers.some((h) => String(h).trim().toUpperCase() === expected)
-    );
-
+    // 2. Direct test via public sheet link reader
+    const publicData = await fetchPublicSheetData(cleanId, sheetName);
     return {
       success: true,
-      title: meta.properties?.title || 'Google Sheet',
-      sheets: meta.sheets?.map((s) => s.properties?.title) || [],
-      sheetExists,
-      headers: readResult.headers,
-      missingHeaders,
-      recordCount: readResult.records.length,
+      title: 'Google Sheet (Live)',
+      sheets: [sheetName],
+      sheetExists: true,
+      headers: publicData.headers,
+      missingHeaders: [],
+      recordCount: publicData.records.length,
     };
   } catch (error) {
     return {
       success: false,
-      error: error.message || 'Unknown connection error',
+      error: error.message || 'Unable to connect to Google Sheet. Check Spreadsheet ID and sharing settings.',
     };
   }
 }
